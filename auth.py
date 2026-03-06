@@ -95,6 +95,14 @@ def _decrypt_profile(row: dict) -> dict:
         "api_key":          decrypt(row.get("anthropic_api_key") or ""),
         "team_name_filter": row.get("team_name_filter") or "",
         "league_context":   row.get("league_context") or "",
+        # Email settings
+        "email_to":         row.get("email_to") or "",
+        "smtp_from":        row.get("smtp_from") or "",
+        "smtp_password":    decrypt(row.get("smtp_password") or ""),
+        "smtp_host":        row.get("smtp_host") or "smtp.gmail.com",
+        "smtp_port":        row.get("smtp_port") or 587,
+        "email_schedule":   row.get("email_schedule") or "manual",
+        "last_email_sent":  row.get("last_email_sent") or "",
     }
 
 
@@ -145,6 +153,28 @@ def update_profile(
 def save_league_context(profile_id: int, user_id: int, league_context: str) -> None:
     """Quick-save just the league context notes without touching other fields."""
     database.save_league_context(profile_id, user_id, league_context)
+
+
+def save_email_config(
+    profile_id: int,
+    user_id: int,
+    email_to: str,
+    smtp_from: str,
+    smtp_password: str,
+    smtp_host: str,
+    smtp_port: int,
+    email_schedule: str,
+) -> None:
+    """Encrypt SMTP password and persist email settings."""
+    database.save_email_config(
+        profile_id, user_id,
+        email_to, smtp_from, encrypt(smtp_password),
+        smtp_host, smtp_port, email_schedule,
+    )
+
+
+def update_last_email_sent(profile_id: int, user_id: int) -> None:
+    database.update_last_email_sent(profile_id, user_id)
 
 
 def delete_profile(profile_id: int, user_id: int) -> None:
