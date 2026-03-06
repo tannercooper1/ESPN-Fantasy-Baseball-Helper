@@ -296,6 +296,7 @@ _SS_DEFAULTS = {
     "editing_profile":    False,
     "chat_messages":      [],        # AI chat history for active session
     "league_refresh_key": 0,         # increment to bust load_league cache
+    "ai_advice":          None,      # cached AI recommendation text
 }
 for _k, _v in _SS_DEFAULTS.items():
     if _k not in st.session_state:
@@ -662,6 +663,7 @@ def render_dashboard():
         if st.button("⬅ Switch Profile", use_container_width=True):
             st.session_state.active_profile   = None
             st.session_state.chat_messages    = []
+            st.session_state.ai_advice        = None
             go_to("profiles")
         if st.button("✏️ Edit Settings", use_container_width=True):
             st.session_state.editing_profile = True
@@ -719,6 +721,7 @@ def render_dashboard():
         if st.button("🔄 Refresh", use_container_width=True, key="refresh_league",
                      help="Fetch latest roster/standings from ESPN"):
             st.session_state.league_refresh_key += 1
+            st.session_state.ai_advice = None
             st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -758,25 +761,46 @@ def render_dashboard():
         my_team = team_options[selected]
 
     # ── Stats bar ──
-    matchup = get_matchup(league, my_team)
+    roster_data = get_roster_data(my_team)
+    matchup     = get_matchup(league, my_team)
+    sorted_teams = sorted(league.teams, key=lambda t: t.wins, reverse=True)
+    my_standing  = next((i + 1 for i, t in enumerate(sorted_teams) if t == my_team), "?")
+    injured      = [p for p in roster_data if p["injury"]]
+
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.markdown(f"""<div class="stat-card"><div class="stat-label">League</div>
-        <div class="stat-value" style="font-size:1.1rem;margin-top:4px">
-        {league.settings.name}</div></div>""", unsafe_allow_html=True)
-    with col2:
-        st.markdown(f"""<div class="stat-card"><div class="stat-label">Your Team</div>
-        <div class="stat-value" style="font-size:1.1rem;margin-top:4px">
-        {my_team.team_name}</div></div>""", unsafe_allow_html=True)
-    with col3:
         st.markdown(f"""<div class="stat-card"><div class="stat-label">Record</div>
         <div class="stat-value">{my_team.wins}–{my_team.losses}</div></div>""",
                     unsafe_allow_html=True)
+    with col2:
+        st.markdown(f"""<div class="stat-card"><div class="stat-label">Standing</div>
+        <div class="stat-value">{my_standing}
+        <span style="font-size:0.9rem;color:#4a7fa5"> of {len(league.teams)}</span>
+        </div></div>""", unsafe_allow_html=True)
+    with col3:
+        if matchup:
+            score_color = "#34d399" if matchup["my_score"] > matchup["opp_score"] else "#f87171"
+            score_str   = (f'<span style="color:{score_color}">{matchup["my_score"]}</span>'
+                           f' – {matchup["opp_score"]}')
+            opp_label   = matchup["opponent"]
+        else:
+            score_str, opp_label = "N/A", "—"
+        st.markdown(f"""<div class="stat-card">
+        <div class="stat-label">vs {opp_label}</div>
+        <div class="stat-value" style="font-size:1.4rem;margin-top:4px">{score_str}</div>
+        </div>""", unsafe_allow_html=True)
     with col4:
-        opp_str = matchup["opponent"] if matchup else "N/A"
-        st.markdown(f"""<div class="stat-card"><div class="stat-label">This Week vs</div>
-        <div class="stat-value" style="font-size:1.1rem;margin-top:4px">
-        {opp_str}</div></div>""", unsafe_allow_html=True)
+        inj_color = "#f87171" if injured else "#34d399"
+        inj_label = f"{len(injured)} injured" if injured else "All healthy"
+        inj_list  = ", ".join(p["name"].split()[-1] for p in injured[:3])
+        if len(injured) > 3:
+            inj_list += f" +{len(injured)-3}"
+        st.markdown(f"""<div class="stat-card"><div class="stat-label">Roster Health</div>
+        <div class="stat-value" style="font-size:1.1rem;margin-top:4px;color:{inj_color}">
+        {inj_label}</div>
+        {"<div style='color:#4a7fa5;font-size:0.75rem;margin-top:2px'>" + inj_list + "</div>"
+         if inj_list else ""}
+        </div>""", unsafe_allow_html=True)
 
     # ── Tabs ──
     tab_overview, tab_chat = st.tabs(["📊 Overview", "🤖 AI Chat"])
@@ -785,75 +809,107 @@ def render_dashboard():
     #  OVERVIEW TAB
     # ════════════════
     with tab_overview:
-        left, right = st.columns([3, 2])
+        team_col, ai_col = st.columns([5, 4])
 
-        with left:
-            st.markdown('<div class="section-header">📋 Current Roster</div>',
-                        unsafe_allow_html=True)
-            roster_data = get_roster_data(my_team)
-            rows_html = ""
-            for p in roster_data:
-                inj = (f'<span class="injury-tag">{p["injury"]}</span>'
-                       if p["injury"] else "")
-                rows_html += f"""<tr>
-                    <td>{p['name']} {inj}</td>
-                    <td>{p['pos']}</td>
-                    <td>{p['proj']}</td>
-                </tr>"""
-            st.markdown(f"""
-            <table class="roster-table">
-                <thead><tr><th>Player</th><th>Position</th><th>Proj Pts</th></tr></thead>
-                <tbody>{rows_html}</tbody>
-            </table>""", unsafe_allow_html=True)
-
-        with right:
-            st.markdown('<div class="section-header">🏆 Standings</div>',
-                        unsafe_allow_html=True)
-            for i, team in enumerate(
-                sorted(league.teams, key=lambda t: t.wins, reverse=True), 1
-            ):
-                hl = ("border-left:3px solid #3b82f6;padding-left:0.5rem;"
-                      if team == my_team else "")
-                st.markdown(f"""
-                <div class="standing-row" style="{hl}">
-                    <span class="standing-rank">{i}</span>
-                    <span class="standing-name">{team.team_name}</span>
-                    <span class="standing-record">{team.wins}–{team.losses}</span>
-                </div>""", unsafe_allow_html=True)
-
-            st.markdown('<div class="section-header">🔄 Top Free Agents</div>',
-                        unsafe_allow_html=True)
-            for fa in get_free_agents(league):
-                st.markdown(f"""
-                <div class="fa-card">
-                    <span class="fa-name">{fa['name']}</span>
-                    <span class="fa-pos">{fa['pos']}</span>
-                    <span class="fa-proj">{fa['proj']} pts</span>
-                </div>""", unsafe_allow_html=True)
-
-        # ── AI Recommendations ──
-        st.markdown("---")
-        if not prof["api_key"]:
-            st.warning("Add an Anthropic API key to this profile to get AI recommendations.")
-        else:
-            if st.button("⚾  GET AI RECOMMENDATIONS"):
-                roster_ctx, standings_ctx, fa_ctx, matchup_ctx = build_context(
-                    league, my_team
+        # ── LEFT: Team Summary ──
+        with team_col:
+            # Injury callout banner
+            if injured:
+                alerts = " &nbsp;·&nbsp; ".join(
+                    f'<b>{p["name"]}</b> <span class="injury-tag">{p["injury"]}</span>'
+                    for p in injured
                 )
-                advice = get_ai_advice(
-                    roster_ctx, standings_ctx, fa_ctx, matchup_ctx,
-                    prof["api_key"], prof.get("league_context", ""),
+                st.markdown(
+                    f'<div style="background:#3d1a1a;border:1px solid #7f1d1d;'
+                    f'border-radius:8px;padding:0.6rem 1rem;margin-bottom:0.8rem;'
+                    f'font-size:0.85rem">⚠️ &nbsp;{alerts}</div>',
+                    unsafe_allow_html=True,
                 )
-                for section in advice.split("##"):
-                    section = section.strip()
-                    if not section:
-                        continue
-                    lines   = section.split("\n", 1)
-                    title   = lines[0].strip()
-                    content = lines[1].strip() if len(lines) > 1 else ""
-                    st.markdown(f"### {title}")
-                    st.markdown(f'<div class="rec-card">{content}</div>',
-                                unsafe_allow_html=True)
+
+            # Roster split into batters / pitchers
+            batters  = [p for p in roster_data if p["pos"] not in ("SP", "RP", "P")]
+            pitchers = [p for p in roster_data if p["pos"] in ("SP", "RP", "P")]
+
+            def roster_table(players):
+                rows = ""
+                for p in players:
+                    inj = (f'<span class="injury-tag">{p["injury"]}</span>'
+                           if p["injury"] else "")
+                    rows += (f"<tr><td>{p['name']} {inj}</td>"
+                             f"<td>{p['pos']}</td><td>{p['proj']}</td></tr>")
+                return (f'<table class="roster-table"><thead><tr>'
+                        f'<th>Player</th><th>Pos</th><th>Proj</th>'
+                        f'</tr></thead><tbody>{rows}</tbody></table>')
+
+            st.markdown('<div class="section-header">🏏 Batters</div>',
+                        unsafe_allow_html=True)
+            st.markdown(roster_table(batters), unsafe_allow_html=True)
+            st.markdown('<div class="section-header">⚾ Pitchers</div>',
+                        unsafe_allow_html=True)
+            st.markdown(roster_table(pitchers), unsafe_allow_html=True)
+
+        # ── RIGHT: AI Recommendations ──
+        with ai_col:
+            st.markdown('<div class="section-header">🤖 AI Recommendations</div>',
+                        unsafe_allow_html=True)
+            if not prof["api_key"]:
+                st.warning("Add an Anthropic API key to this profile.")
+            else:
+                btn_label = ("🔄 Regenerate" if st.session_state.ai_advice
+                             else "⚾ Get Recommendations")
+                if st.button(btn_label, use_container_width=True, key="get_advice"):
+                    roster_ctx, standings_ctx, fa_ctx, matchup_ctx = build_context(
+                        league, my_team
+                    )
+                    st.session_state.ai_advice = get_ai_advice(
+                        roster_ctx, standings_ctx, fa_ctx, matchup_ctx,
+                        prof["api_key"], prof.get("league_context", ""),
+                    )
+                    st.rerun()
+
+                if st.session_state.ai_advice:
+                    for section in st.session_state.ai_advice.split("##"):
+                        section = section.strip()
+                        if not section:
+                            continue
+                        lines   = section.split("\n", 1)
+                        title   = lines[0].strip()
+                        content = lines[1].strip() if len(lines) > 1 else ""
+                        st.markdown(f"**{title}**")
+                        st.markdown(f'<div class="rec-card">{content}</div>',
+                                    unsafe_allow_html=True)
+                else:
+                    st.markdown(
+                        "<div style='color:#4a7fa5;font-size:0.88rem;padding:1rem 0'>"
+                        "Click the button above to get AI-powered recommendations "
+                        "for your roster, lineup, waiver wire, and trades."
+                        "</div>",
+                        unsafe_allow_html=True,
+                    )
+
+        # ── Secondary: Standings + Free Agents in expanders ──
+        st.markdown("<br>", unsafe_allow_html=True)
+        exp_col1, exp_col2 = st.columns(2)
+        with exp_col1:
+            with st.expander("🏆 League Standings"):
+                for i, team in enumerate(sorted_teams, 1):
+                    hl = ("border-left:3px solid #3b82f6;padding-left:0.5rem;"
+                          if team == my_team else "")
+                    st.markdown(f"""
+                    <div class="standing-row" style="{hl}">
+                        <span class="standing-rank">{i}</span>
+                        <span class="standing-name">{team.team_name}</span>
+                        <span class="standing-record">{team.wins}–{team.losses}</span>
+                    </div>""", unsafe_allow_html=True)
+        with exp_col2:
+            with st.expander("🔄 Top Free Agents"):
+                for fa in get_free_agents(league):
+                    st.markdown(f"""
+                    <div class="fa-card">
+                        <span class="fa-name">{fa['name']}</span>
+                        <span class="fa-pos">{fa['pos']}</span>
+                        <span class="fa-proj">{fa['proj']} pts</span>
+                    </div>""", unsafe_allow_html=True)
 
     # ════════════════
     #  AI CHAT TAB
