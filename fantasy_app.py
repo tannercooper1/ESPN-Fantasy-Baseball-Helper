@@ -7,6 +7,11 @@ Run with: streamlit run fantasy_app.py
 import streamlit as st
 from espn_api.baseball import League
 import anthropic
+import database
+import auth
+
+# Initialise DB (no-op if already created)
+database.init_db()
 
 # ─────────────────────────────────────────────
 #  PAGE CONFIG
@@ -228,20 +233,121 @@ section[data-testid="stSidebar"] {
 
 
 # ─────────────────────────────────────────────
-#  SIDEBAR CONFIG
+#  SESSION STATE DEFAULTS
+# ─────────────────────────────────────────────
+_DEFAULTS = {
+    "user_id":        None,
+    "username":       None,
+    "s_league_id":    "1740864810",
+    "s_year":         2025,
+    "s_espn_s2":      "",
+    "s_swid":         "",
+    "s_api_key":      "",
+    "s_team_name":    "",
+}
+for _k, _v in _DEFAULTS.items():
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
+
+
+# ─────────────────────────────────────────────
+#  SIDEBAR — AUTH + CONFIG
 # ─────────────────────────────────────────────
 with st.sidebar:
+
+    # ── User account ──────────────────────────
+    if st.session_state.user_id:
+        st.markdown(f"### 👤 {st.session_state.username}")
+
+        if st.button("📥 Load Saved Settings", use_container_width=True):
+            settings = auth.load_settings(st.session_state.user_id)
+            if settings:
+                st.session_state.s_league_id = settings["league_id"]
+                st.session_state.s_year      = settings["season_year"]
+                st.session_state.s_espn_s2   = settings["espn_s2"]
+                st.session_state.s_swid      = settings["swid"]
+                st.session_state.s_api_key   = settings["api_key"]
+                st.session_state.s_team_name = settings["team_name_filter"]
+                st.success("Settings loaded!")
+                st.rerun()
+            else:
+                st.info("No saved settings found.")
+
+        if st.button("💾 Save Current Settings", use_container_width=True):
+            auth.save_settings(
+                st.session_state.user_id,
+                st.session_state.get("s_league_id", ""),
+                int(st.session_state.get("s_year", 2025)),
+                st.session_state.get("s_espn_s2", ""),
+                st.session_state.get("s_swid", ""),
+                st.session_state.get("s_api_key", ""),
+                st.session_state.get("s_team_name", ""),
+            )
+            st.success("Settings saved!")
+
+        if st.button("🚪 Log Out", use_container_width=True):
+            for _k in ("user_id", "username"):
+                st.session_state[_k] = None
+            st.rerun()
+
+    else:
+        st.markdown("### 🔐 Account")
+        _tab_login, _tab_reg = st.tabs(["Log In", "Register"])
+
+        with _tab_login:
+            _lu = st.text_input("Username", key="_login_user")
+            _lp = st.text_input("Password", type="password", key="_login_pass")
+            if st.button("Log In", use_container_width=True):
+                if _lu and _lp:
+                    _ok, _uid, _msg = auth.login_user(_lu, _lp)
+                    if _ok:
+                        st.session_state.user_id  = _uid
+                        st.session_state.username = _lu.strip()
+                        st.rerun()
+                    else:
+                        st.error(_msg)
+                else:
+                    st.warning("Please fill in both fields.")
+
+        with _tab_reg:
+            _ru = st.text_input("Choose a username", key="_reg_user")
+            _rp = st.text_input("Choose a password", type="password", key="_reg_pass")
+            _rp2 = st.text_input("Confirm password", type="password", key="_reg_pass2")
+            if st.button("Create Account", use_container_width=True):
+                if not (_ru and _rp and _rp2):
+                    st.warning("Please fill in all fields.")
+                elif _rp != _rp2:
+                    st.error("Passwords do not match.")
+                else:
+                    _ok, _msg = auth.register_user(_ru, _rp)
+                    if _ok:
+                        st.success(_msg)
+                    else:
+                        st.error(_msg)
+
+    st.markdown("---")
+
+    # ── League configuration ──────────────────
     st.markdown("### ⚙️ Configuration")
-    league_id = st.text_input("League ID", value="1740864810")
-    year      = st.number_input("Season Year", value=2025, min_value=2020, max_value=2026)
-    espn_s2   = st.text_input("espn_s2 cookie", type="password", help="Required for private leagues")
-    swid      = st.text_input("SWID cookie", type="password", help="Required for private leagues")
-    api_key   = st.text_input("Anthropic API Key", type="password")
+    league_id        = st.text_input("League ID", key="s_league_id")
+    year             = st.number_input("Season Year", min_value=2020, max_value=2026,
+                                       step=1, key="s_year")
+    espn_s2          = st.text_input("espn_s2 cookie", type="password",
+                                     key="s_espn_s2",
+                                     help="Required for private leagues")
+    swid             = st.text_input("SWID cookie", type="password",
+                                     key="s_swid",
+                                     help="Required for private leagues")
+    api_key          = st.text_input("Anthropic API Key", type="password",
+                                     key="s_api_key")
     st.markdown("---")
     st.markdown("##### Your Team")
-    team_name_filter = st.text_input("Team name (partial match)", placeholder="Leave blank to select")
+    team_name_filter = st.text_input("Team name (partial match)",
+                                     placeholder="Leave blank to select",
+                                     key="s_team_name")
     st.markdown("---")
-    st.caption("Cookies only needed for private leagues. Get them from browser DevTools → Application → Cookies → espn.com")
+    st.caption("Cookies only needed for private leagues. "
+               "Get them from browser DevTools → Application → Cookies → espn.com")
 
 
 # ─────────────────────────────────────────────
