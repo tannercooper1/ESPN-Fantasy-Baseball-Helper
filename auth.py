@@ -94,6 +94,7 @@ def _decrypt_profile(row: dict) -> dict:
         "swid":             decrypt(row.get("swid") or ""),
         "api_key":          decrypt(row.get("anthropic_api_key") or ""),
         "team_name_filter": row.get("team_name_filter") or "",
+        "league_context":   row.get("league_context") or "",
     }
 
 
@@ -111,11 +112,13 @@ def create_profile(
     swid: str,
     api_key: str,
     team_name_filter: str,
+    league_context: str = "",
 ) -> int:
     """Encrypt sensitive fields and create a new profile. Returns the new profile id."""
     return database.create_profile(
         user_id, name, league_id, season_year,
-        encrypt(espn_s2), encrypt(swid), encrypt(api_key), team_name_filter,
+        encrypt(espn_s2), encrypt(swid), encrypt(api_key),
+        team_name_filter, league_context,
     )
 
 
@@ -129,12 +132,19 @@ def update_profile(
     swid: str,
     api_key: str,
     team_name_filter: str,
+    league_context: str = "",
 ) -> None:
     """Encrypt sensitive fields and update an existing profile."""
     database.update_profile(
         profile_id, user_id, name, league_id, season_year,
-        encrypt(espn_s2), encrypt(swid), encrypt(api_key), team_name_filter,
+        encrypt(espn_s2), encrypt(swid), encrypt(api_key),
+        team_name_filter, league_context,
     )
+
+
+def save_league_context(profile_id: int, user_id: int, league_context: str) -> None:
+    """Quick-save just the league context notes without touching other fields."""
+    database.save_league_context(profile_id, user_id, league_context)
 
 
 def delete_profile(profile_id: int, user_id: int) -> None:
