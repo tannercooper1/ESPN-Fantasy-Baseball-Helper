@@ -239,6 +239,48 @@ section[data-testid="stSidebar"] {
     background: #0d1b2a !important;
     border-right: 1px solid #1e3a5f !important;
 }
+
+/* ── Chat messages ── */
+[data-testid="stChatMessage"] {
+    background: transparent !important;
+    padding: 0.3rem 0 !important;
+}
+[data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] p {
+    color: #c8d8e8;
+    font-size: 0.92rem;
+    line-height: 1.7;
+}
+/* User bubble */
+[data-testid="stChatMessage"][data-role="user"] {
+    flex-direction: row-reverse;
+}
+[data-testid="stChatMessage"][data-role="user"] .stChatMessageContent {
+    background: #1e3a5f !important;
+    border-radius: 16px 4px 16px 16px !important;
+    padding: 0.6rem 1rem !important;
+}
+/* Assistant bubble */
+[data-testid="stChatMessage"][data-role="assistant"] .stChatMessageContent {
+    background: #111827 !important;
+    border: 1px solid #1e3a5f !important;
+    border-radius: 4px 16px 16px 16px !important;
+    padding: 0.6rem 1rem !important;
+}
+/* Chat input bar */
+[data-testid="stChatInput"] {
+    background: #111827 !important;
+    border: 1px solid #1e3a5f !important;
+    border-radius: 12px !important;
+}
+[data-testid="stChatInput"] textarea {
+    color: #e8e8e8 !important;
+    font-size: 0.92rem !important;
+}
+/* Scrollable message container — remove default border/bg */
+[data-testid="stVerticalBlockBorderWrapper"] {
+    border: none !important;
+    background: transparent !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -802,46 +844,67 @@ def _render_ai_chat(prof: dict, league, my_team):
     client        = anthropic.Anthropic(api_key=prof["api_key"])
     messages      = st.session_state.chat_messages
 
-    # Welcome message on first load
-    if not messages:
+    # ── Thin header: context badge + clear button ──
+    hdr_left, hdr_right = st.columns([5, 1])
+    with hdr_left:
+        has_notes = bool(prof.get("league_context", "").strip())
+        badge = ("🟢 League notes loaded" if has_notes
+                 else "⚪ No league notes — add them in the sidebar")
         st.markdown(
-            "<div style='color:#4a7fa5;font-size:0.88rem;margin-bottom:1rem'>"
-            "Ask me anything about your roster, matchup, free agents, or trade strategy. "
-            "I have your live league data and notes loaded.</div>",
+            f"<div style='color:#4a7fa5;font-size:0.8rem;padding:0.3rem 0'>{badge}</div>",
             unsafe_allow_html=True,
         )
-
-    # Render history
-    for msg in messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-
-    # Clear chat button
-    if messages:
-        if st.button("🗑️ Clear chat", key="clear_chat"):
+    with hdr_right:
+        if messages and st.button("🗑 Clear", key="clear_chat"):
             st.session_state.chat_messages = []
             st.rerun()
 
-    # Input
-    user_input = st.chat_input("Ask about your team, trades, lineup, keepers…")
-    if user_input:
-        messages.append({"role": "user", "content": user_input})
-        with st.chat_message("user"):
-            st.markdown(user_input)
+    # ── Message area (fixed height, scrolls up as conversation grows) ──
+    # Declared here so it sits above the input visually; filled below.
+    msg_container = st.container(height=540, border=False)
 
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking…"):
-                response = client.messages.create(
+    # ── Input — Streamlit pins this to the bottom of the tab ──
+    user_input = st.chat_input("Ask about your team, trades, lineup, keepers…")
+
+    # ── Fill the message container ──
+    with msg_container:
+        if not messages:
+            st.markdown(
+                "<div style='color:#4a7fa5;font-size:0.88rem;"
+                "padding:1rem 0 0.5rem'>"
+                "Ask me anything about your roster, matchup, free agents, or "
+                "trade strategy. I already have your live league data loaded."
+                "</div>",
+                unsafe_allow_html=True,
+            )
+
+        # Render existing history
+        for msg in messages:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+        # Handle new message + stream response inside the container
+        if user_input:
+            messages.append({"role": "user", "content": user_input})
+            with st.chat_message("user"):
+                st.markdown(user_input)
+
+            with st.chat_message("assistant"):
+                placeholder = st.empty()
+                full_text   = ""
+                with client.messages.stream(
                     model="claude-sonnet-4-20250514",
                     max_tokens=1500,
                     system=system_prompt,
                     messages=messages,
-                )
-            reply = response.content[0].text
-            st.markdown(reply)
+                ) as stream:
+                    for chunk in stream.text_stream:
+                        full_text += chunk
+                        placeholder.markdown(full_text + "▌")
+                placeholder.markdown(full_text)
 
-        messages.append({"role": "assistant", "content": reply})
-        st.session_state.chat_messages = messages
+            messages.append({"role": "assistant", "content": full_text})
+            st.session_state.chat_messages = messages
 
 
 def _render_profile_editor(prof: dict):
