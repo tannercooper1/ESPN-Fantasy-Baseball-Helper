@@ -4,6 +4,12 @@ ESPN Fantasy Baseball AI Advisor — Streamlit App
 Run with: streamlit run fantasy_app.py
 """
 
+import datetime
+import smtplib
+import textwrap
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
 import streamlit as st
 from espn_api.baseball import League
 import anthropic
@@ -297,6 +303,7 @@ _SS_DEFAULTS = {
     "chat_messages":      [],        # AI chat history for active session
     "league_refresh_key": 0,         # increment to bust load_league cache
     "ai_advice":          None,      # cached AI recommendation text
+    "email_preview":      None,      # generated report text awaiting send
 }
 for _k, _v in _SS_DEFAULTS.items():
     if _k not in st.session_state:
@@ -645,6 +652,252 @@ How to optimize the lineup. Flag injured or underperforming players."""
 
 
 # ═════════════════════════════════════════════
+#  EMAIL HELPERS
+# ═════════════════════════════════════════════
+
+_SCHEDULE_OPTIONS = {
+    "manual":    "Manual only",
+    "monday":    "Every Monday",
+    "tuesday":   "Every Tuesday",
+    "wednesday": "Every Wednesday",
+    "thursday":  "Every Thursday",
+    "friday":    "Every Friday",
+    "saturday":  "Every Saturday",
+    "sunday":    "Every Sunday",
+}
+_DAY_MAP = {label: i for i, label in enumerate(
+    ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+)}
+
+
+def _report_is_due(prof: dict) -> bool:
+    """Return True if today matches the schedule and we haven't sent today yet."""
+    schedule = prof.get("email_schedule", "manual")
+    if schedule == "manual" or not schedule:
+        return False
+    if _DAY_MAP.get(schedule) != datetime.datetime.now().weekday():
+        return False
+    last = prof.get("last_email_sent", "")
+    if last:
+        try:
+            last_dt = datetime.datetime.fromisoformat(str(last))
+            if last_dt.date() == datetime.datetime.now().date():
+                return False
+        except Exception:
+            pass
+    return True
+
+
+def generate_weekly_report(prof: dict, league, my_team) -> str:
+    """Ask Claude for a weekly email report narrative."""
+    roster_lines, standings_lines, fa_lines, matchup_str = build_context(league, my_team)
+
+    context_section = ""
+    if prof.get("league_context", "").strip():
+        context_section = (
+            f"\n=== LEAGUE NOTES (treat as authoritative) ===\n"
+            f"{prof['league_context'].strip()}\n"
+        )
+
+    sorted_teams = sorted(league.teams, key=lambda t: t.wins, reverse=True)
+    my_standing  = next((i + 1 for i, t in enumerate(sorted_teams) if t == my_team), "?")
+
+    prompt = f"""Write a concise weekly fantasy baseball email report for the team \
+"{my_team.team_name}" in "{league.settings.name}" (season {prof['season_year']}).
+
+Current record: {my_team.wins}–{my_team.losses}, standing {my_standing} of \
+{len(league.teams)}.
+{context_section}
+=== ROSTER ===
+{roster_lines}
+
+=== STANDINGS ===
+{standings_lines}
+
+=== FREE AGENTS ===
+{fa_lines}
+
+=== CURRENT MATCHUP ===
+{matchup_str}
+
+Write the report in these four sections. Be specific with player names. \
+Factor in any keeper rules or league notes above.
+
+## This Week's Matchup
+2–3 sentences: assess the matchup, who has the edge and why.
+
+## Priority Actions
+3–5 concrete bullet points — the most important things to do right now \
+(pickups, drops, lineup moves). Lead with the most urgent.
+
+## Waiver Wire Targets
+Top 2–3 free agents worth adding this week and why.
+
+## Looking Ahead
+1–2 sentences on upcoming schedule, trade targets, or keeper considerations."""
+
+    client = anthropic.Anthropic(api_key=prof["api_key"])
+    with st.spinner("Generating your weekly report…"):
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1200,
+            messages=[{"role": "user", "content": prompt}],
+        )
+    return response.content[0].text
+
+
+def build_html_email(prof: dict, league, my_team, report_text: str) -> str:
+    """Render the weekly report as a clean HTML email (light theme, inline styles)."""
+    sorted_teams = sorted(league.teams, key=lambda t: t.wins, reverse=True)
+    my_standing  = next((i + 1 for i, t in enumerate(sorted_teams) if t == my_team), "?")
+    roster_data  = get_roster_data(my_team)
+    matchup      = get_matchup(league, my_team)
+    injured      = [p for p in roster_data if p["injury"]]
+    date_str     = datetime.datetime.now().strftime("%B %d, %Y")
+
+    matchup_str = "—"
+    if matchup:
+        matchup_str = (f"{my_team.team_name} {matchup['my_score']} – "
+                       f"{matchup['opp_score']} {matchup['opponent']}")
+
+    injury_html = ""
+    if injured:
+        names = ", ".join(
+            f"{p['name']} <span style='color:#dc2626'>({p['injury']})</span>"
+            for p in injured
+        )
+        injury_html = f"""
+        <tr><td colspan="2" style="padding:8px 16px;background:#fef2f2;
+            border-left:3px solid #dc2626;font-size:13px;color:#7f1d1d">
+            ⚠️ &nbsp;{names}
+        </td></tr>"""
+
+    # Convert markdown-ish report text to simple HTML paragraphs
+    html_sections = ""
+    for block in report_text.split("##"):
+        block = block.strip()
+        if not block:
+            continue
+        lines  = block.split("\n", 1)
+        title  = lines[0].strip()
+        body   = lines[1].strip() if len(lines) > 1 else ""
+        # Convert bullet lines
+        body_html = ""
+        for line in body.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith(("- ", "• ", "* ")):
+                body_html += (f"<li style='margin:4px 0;color:#374151'>"
+                              f"{line[2:]}</li>")
+            else:
+                if body_html.endswith("</li>"):
+                    body_html = f"<ul style='margin:8px 0 0 16px;padding:0'>{body_html}</ul>"
+                body_html += f"<p style='margin:6px 0;color:#374151'>{line}</p>"
+        if body_html.endswith("</li>"):
+            body_html = f"<ul style='margin:8px 0 0 16px;padding:0'>{body_html}</ul>"
+
+        html_sections += f"""
+        <tr><td style="padding:20px 24px 4px">
+            <h3 style="margin:0;font-size:15px;color:#1e3a5f;
+                       border-bottom:1px solid #e5e7eb;padding-bottom:8px">{title}</h3>
+        </td></tr>
+        <tr><td style="padding:4px 24px 16px;font-size:14px;line-height:1.6">
+            {body_html}
+        </td></tr>"""
+
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>Fantasy Baseball Weekly Report</title></head>
+<body style="margin:0;padding:0;background:#f3f4f6;font-family:Arial,sans-serif">
+<table width="100%" cellpadding="0" cellspacing="0"
+       style="background:#f3f4f6;padding:24px 0">
+<tr><td align="center">
+<table width="600" cellpadding="0" cellspacing="0"
+       style="background:#ffffff;border-radius:12px;overflow:hidden;
+              box-shadow:0 2px 8px rgba(0,0,0,0.08)">
+
+  <!-- Header -->
+  <tr><td style="background:#0d1b2a;padding:24px;text-align:center">
+    <div style="font-size:28px;font-weight:900;letter-spacing:3px;
+                color:#ffffff;text-transform:uppercase">⚾ Fantasy Report</div>
+    <div style="color:#7ab8e8;font-size:13px;margin-top:4px">{date_str}</div>
+  </td></tr>
+
+  <!-- Stats strip -->
+  <tr><td style="background:#1e3a5f;padding:12px 24px">
+    <table width="100%" cellpadding="0" cellspacing="0">
+    <tr>
+      <td style="text-align:center;color:#fff;width:33%">
+        <div style="font-size:11px;text-transform:uppercase;
+                    letter-spacing:1px;color:#7ab8e8">Team</div>
+        <div style="font-size:15px;font-weight:bold">{my_team.team_name}</div>
+      </td>
+      <td style="text-align:center;color:#fff;width:33%">
+        <div style="font-size:11px;text-transform:uppercase;
+                    letter-spacing:1px;color:#7ab8e8">Record</div>
+        <div style="font-size:15px;font-weight:bold">
+            {my_team.wins}–{my_team.losses} &nbsp;·&nbsp;
+            #{my_standing} of {len(league.teams)}</div>
+      </td>
+      <td style="text-align:center;color:#fff;width:34%">
+        <div style="font-size:11px;text-transform:uppercase;
+                    letter-spacing:1px;color:#7ab8e8">This Week</div>
+        <div style="font-size:13px;font-weight:bold">{matchup_str}</div>
+      </td>
+    </tr>
+    </table>
+  </td></tr>
+
+  <!-- Injury alert -->
+  {injury_html}
+
+  <!-- AI Report sections -->
+  {html_sections}
+
+  <!-- Footer -->
+  <tr><td style="background:#f9fafb;padding:16px 24px;text-align:center;
+                 border-top:1px solid #e5e7eb">
+    <div style="font-size:11px;color:#9ca3af">
+      {prof['name']} · {league.settings.name} · {prof['season_year']}
+      &nbsp;·&nbsp; Generated by Fantasy Baseball Advisor
+    </div>
+  </td></tr>
+
+</table>
+</td></tr>
+</table>
+</body></html>"""
+
+
+def send_gmail(
+    to: str, from_addr: str, app_password: str,
+    smtp_host: str, smtp_port: int,
+    subject: str, html_body: str,
+) -> tuple[bool, str]:
+    """Send an HTML email via SMTP. Returns (success, message)."""
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"]    = from_addr
+        msg["To"]      = to
+        msg.attach(MIMEText(html_body, "html"))
+
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(from_addr, app_password)
+            server.sendmail(from_addr, [t.strip() for t in to.split(",")],
+                            msg.as_string())
+        return True, "Email sent successfully!"
+    except smtplib.SMTPAuthenticationError:
+        return False, ("Authentication failed. For Gmail, use an App Password "
+                       "(myaccount.google.com → Security → App passwords).")
+    except Exception as e:
+        return False, f"Failed to send: {e}"
+
+
+# ═════════════════════════════════════════════
 #  PAGE 3 — DASHBOARD
 # ═════════════════════════════════════════════
 def render_dashboard():
@@ -802,8 +1055,20 @@ def render_dashboard():
          if inj_list else ""}
         </div>""", unsafe_allow_html=True)
 
+    # ── Scheduled-report banner ──
+    if _report_is_due(prof) and prof.get("api_key") and prof.get("smtp_password"):
+        banner_col, dismiss_col = st.columns([5, 1])
+        with banner_col:
+            st.info(
+                f"📧 Your scheduled weekly report is ready to send "
+                f"({_SCHEDULE_OPTIONS.get(prof['email_schedule'], '')}). "
+                f"Go to the **Email Reports** tab to generate and send it."
+            )
+
     # ── Tabs ──
-    tab_overview, tab_chat = st.tabs(["📊 Overview", "🤖 AI Chat"])
+    tab_overview, tab_chat, tab_email = st.tabs(
+        ["📊 Overview", "🤖 AI Chat", "📧 Email Reports"]
+    )
 
     # ════════════════
     #  OVERVIEW TAB
@@ -920,6 +1185,12 @@ def render_dashboard():
         else:
             _render_ai_chat(prof, league, my_team)
 
+    # ════════════════
+    #  EMAIL TAB
+    # ════════════════
+    with tab_email:
+        _render_email_tab(prof, league, my_team)
+
 
 def _render_ai_chat(prof: dict, league, my_team):
     """Conversational AI chat grounded in live league data + league notes."""
@@ -988,6 +1259,154 @@ def _render_ai_chat(prof: dict, league, my_team):
 
             messages.append({"role": "assistant", "content": full_text})
             st.session_state.chat_messages = messages
+
+
+def _render_email_tab(prof: dict, league, my_team):
+    st.markdown('<div class="section-header">📧 Email Reports</div>',
+                unsafe_allow_html=True)
+
+    email_configured = bool(prof.get("smtp_password") and prof.get("email_to"))
+
+    # ── Email config ──
+    with st.expander("⚙️ Email Settings", expanded=not email_configured):
+        with st.form("email_config_form"):
+            ec1, ec2 = st.columns(2)
+            with ec1:
+                e_to   = st.text_input("Send report to",
+                                       value=prof.get("email_to", ""),
+                                       placeholder="you@example.com")
+                e_from = st.text_input("Send from (Gmail address)",
+                                       value=prof.get("smtp_from", ""),
+                                       placeholder="yourname@gmail.com")
+            with ec2:
+                e_pass = st.text_input(
+                    "Gmail App Password",
+                    type="password",
+                    value=prof.get("smtp_password", ""),
+                    help=("Generate at myaccount.google.com → Security → "
+                          "2-Step Verification → App passwords"),
+                )
+                schedule_labels = list(_SCHEDULE_OPTIONS.values())
+                schedule_keys   = list(_SCHEDULE_OPTIONS.keys())
+                current_sched   = prof.get("email_schedule", "manual")
+                sched_idx       = (schedule_keys.index(current_sched)
+                                   if current_sched in schedule_keys else 0)
+                e_sched = st.selectbox("Auto-send schedule", schedule_labels,
+                                       index=sched_idx)
+
+            # Advanced SMTP (collapsed by default via help text)
+            with st.expander("Advanced SMTP settings"):
+                ea1, ea2 = st.columns(2)
+                with ea1:
+                    e_host = st.text_input("SMTP host",
+                                           value=prof.get("smtp_host", "smtp.gmail.com"))
+                with ea2:
+                    e_port = st.number_input("SMTP port",
+                                             value=int(prof.get("smtp_port", 587)),
+                                             min_value=1, max_value=65535)
+
+            if st.form_submit_button("Save Email Settings", use_container_width=True):
+                sched_key = schedule_keys[schedule_labels.index(e_sched)]
+                auth.save_email_config(
+                    prof["id"], st.session_state.user_id,
+                    e_to.strip(), e_from.strip(),
+                    e_pass,
+                    e_host.strip(), int(e_port),
+                    sched_key,
+                )
+                # Refresh active profile
+                updated = database.get_profile(prof["id"], st.session_state.user_id)
+                if updated:
+                    st.session_state.active_profile = auth._decrypt_profile(updated)
+                st.success("Email settings saved!")
+                st.rerun()
+
+        st.caption(
+            "Gmail users: enable 2-Step Verification, then create an App Password at "
+            "myaccount.google.com → Security → App passwords. "
+            "Use the 16-character app password here, not your regular Gmail password."
+        )
+
+    if not email_configured:
+        st.info("Configure email settings above to start sending reports.")
+        return
+
+    if not prof.get("api_key"):
+        st.warning("Add an Anthropic API key to this profile to generate reports.")
+        return
+
+    # ── Schedule status ──
+    sched_label = _SCHEDULE_OPTIONS.get(prof.get("email_schedule", "manual"), "Manual")
+    last_sent   = prof.get("last_email_sent", "")
+    last_str    = (f"Last sent: {last_sent[:10]}" if last_sent
+                   else "Never sent")
+    st.markdown(
+        f"<div style='color:#4a7fa5;font-size:0.85rem;margin-bottom:1rem'>"
+        f"Schedule: <strong style='color:#7ab8e8'>{sched_label}</strong> "
+        f"&nbsp;·&nbsp; {last_str} "
+        f"&nbsp;·&nbsp; Sending to: <strong style='color:#7ab8e8'>"
+        f"{prof['email_to']}</strong></div>",
+        unsafe_allow_html=True,
+    )
+
+    # ── Generate & preview ──
+    gen_col, send_col = st.columns([1, 1])
+    with gen_col:
+        if st.button("📝 Generate Report", use_container_width=True,
+                     key="gen_report"):
+            st.session_state.email_preview = generate_weekly_report(
+                prof, league, my_team
+            )
+            st.rerun()
+
+    preview = st.session_state.get("email_preview")
+
+    with send_col:
+        if st.button("📨 Send Report", use_container_width=True,
+                     key="send_report",
+                     disabled=not preview):
+            html_body = build_html_email(prof, league, my_team, preview)
+            subject   = (f"⚾ Weekly Fantasy Report — {my_team.team_name} — "
+                         f"{datetime.datetime.now().strftime('%b %d')}")
+            ok, msg = send_gmail(
+                prof["email_to"], prof["smtp_from"], prof["smtp_password"],
+                prof["smtp_host"], int(prof["smtp_port"]),
+                subject, html_body,
+            )
+            if ok:
+                auth.update_last_email_sent(prof["id"], st.session_state.user_id)
+                updated = database.get_profile(prof["id"], st.session_state.user_id)
+                if updated:
+                    st.session_state.active_profile = auth._decrypt_profile(updated)
+                st.session_state.email_preview = None
+                st.success(f"✅ Report sent to {prof['email_to']}!")
+                st.rerun()
+            else:
+                st.error(msg)
+
+    # ── Report preview ──
+    if preview:
+        st.markdown("---")
+        st.markdown("**Preview** — review before sending:")
+        # Render each section neatly
+        for block in preview.split("##"):
+            block = block.strip()
+            if not block:
+                continue
+            lines = block.split("\n", 1)
+            title = lines[0].strip()
+            body  = lines[1].strip() if len(lines) > 1 else ""
+            st.markdown(f"**{title}**")
+            st.markdown(f'<div class="rec-card">{body}</div>',
+                        unsafe_allow_html=True)
+    else:
+        st.markdown(
+            "<div style='color:#4a7fa5;font-size:0.88rem;padding:0.5rem 0'>"
+            "Click <strong>Generate Report</strong> to create your weekly summary, "
+            "then <strong>Send Report</strong> to email it."
+            "</div>",
+            unsafe_allow_html=True,
+        )
 
 
 def _render_profile_editor(prof: dict):

@@ -42,10 +42,21 @@ def init_db() -> None:
                 updated_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Add league_context column if upgrading from older schema
+        # Column migrations for older schemas
         cols = {r[1] for r in conn.execute("PRAGMA table_info(profiles)")}
-        if "league_context" not in cols:
-            conn.execute("ALTER TABLE profiles ADD COLUMN league_context TEXT DEFAULT ''")
+        _migrations = {
+            "league_context":  "ALTER TABLE profiles ADD COLUMN league_context TEXT DEFAULT ''",
+            "email_to":        "ALTER TABLE profiles ADD COLUMN email_to TEXT DEFAULT ''",
+            "smtp_from":       "ALTER TABLE profiles ADD COLUMN smtp_from TEXT DEFAULT ''",
+            "smtp_password":   "ALTER TABLE profiles ADD COLUMN smtp_password TEXT DEFAULT ''",
+            "smtp_host":       "ALTER TABLE profiles ADD COLUMN smtp_host TEXT DEFAULT 'smtp.gmail.com'",
+            "smtp_port":       "ALTER TABLE profiles ADD COLUMN smtp_port INTEGER DEFAULT 587",
+            "email_schedule":  "ALTER TABLE profiles ADD COLUMN email_schedule TEXT DEFAULT 'manual'",
+            "last_email_sent": "ALTER TABLE profiles ADD COLUMN last_email_sent TIMESTAMP",
+        }
+        for col, sql in _migrations.items():
+            if col not in cols:
+                conn.execute(sql)
 
         # Migrate old league_settings table if it exists
         tables = {r[0] for r in conn.execute(
@@ -197,6 +208,52 @@ def save_league_context(profile_id: int, user_id: int, league_context: str) -> N
                 WHERE id = ? AND user_id = ?
                 """,
                 (league_context, profile_id, user_id),
+            )
+    finally:
+        conn.close()
+
+
+def save_email_config(
+    profile_id: int,
+    user_id: int,
+    email_to: str,
+    smtp_from: str,
+    smtp_password_enc: str,
+    smtp_host: str,
+    smtp_port: int,
+    email_schedule: str,
+) -> None:
+    """Persist email settings for a profile."""
+    conn = get_connection()
+    try:
+        with conn:
+            conn.execute(
+                """
+                UPDATE profiles
+                SET email_to = ?, smtp_from = ?, smtp_password = ?,
+                    smtp_host = ?, smtp_port = ?, email_schedule = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND user_id = ?
+                """,
+                (email_to, smtp_from, smtp_password_enc, smtp_host, smtp_port,
+                 email_schedule, profile_id, user_id),
+            )
+    finally:
+        conn.close()
+
+
+def update_last_email_sent(profile_id: int, user_id: int) -> None:
+    """Stamp the current UTC time as last_email_sent."""
+    conn = get_connection()
+    try:
+        with conn:
+            conn.execute(
+                """
+                UPDATE profiles
+                SET last_email_sent = CURRENT_TIMESTAMP
+                WHERE id = ? AND user_id = ?
+                """,
+                (profile_id, user_id),
             )
     finally:
         conn.close()
