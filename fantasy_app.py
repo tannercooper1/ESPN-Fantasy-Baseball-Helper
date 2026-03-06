@@ -252,6 +252,7 @@ _SS_DEFAULTS = {
     "username":         None,
     "active_profile":   None,      # decrypted profile dict
     "editing_profile":  False,
+    "chat_messages":    [],        # AI chat history for active session
 }
 for _k, _v in _SS_DEFAULTS.items():
     if _k not in st.session_state:
@@ -511,11 +512,59 @@ def build_context(league, my_team):
     return roster_lines, standings_lines, fa_lines, matchup_str
 
 
-def get_ai_advice(roster, standings, fa, matchup, api_key):
+def build_system_prompt(prof: dict, league, my_team) -> str:
+    """
+    Build a rich system prompt that encodes everything the AI needs to know
+    about this specific league and team — live data + user's saved context notes.
+    This is the 'league-specific AI skill' that persists across interactions.
+    """
+    roster_lines, standings_lines, fa_lines, matchup_str = build_context(league, my_team)
+
+    league_context_section = ""
+    if prof.get("league_context", "").strip():
+        league_context_section = f"""
+=== LEAGUE NOTES (provided by the user — treat as authoritative) ===
+{prof['league_context'].strip()}
+"""
+
+    return f"""You are a dedicated fantasy baseball AI advisor for the team "{my_team.team_name}" \
+in the "{league.settings.name}" ESPN league (season {prof['season_year']}).
+
+Your job is to give specific, actionable advice grounded in the live data and the \
+user's league notes below. Always reference real player names. Factor in keeper \
+considerations, trade restrictions, league quirks, and strategic context from the \
+notes when they are relevant.
+{league_context_section}
+=== LIVE LEAGUE DATA ===
+
+MY ROSTER:
+{roster_lines}
+
+STANDINGS:
+{standings_lines}
+
+FREE AGENTS:
+{fa_lines}
+
+CURRENT MATCHUP:
+{matchup_str}
+"""
+
+
+def get_ai_advice(roster, standings, fa, matchup, api_key, league_context: str = ""):
     client = anthropic.Anthropic(api_key=api_key)
+
+    context_section = ""
+    if league_context.strip():
+        context_section = f"""
+=== LEAGUE NOTES (treat as authoritative) ===
+{league_context.strip()}
+
+"""
+
     prompt = f"""You are an expert fantasy baseball analyst. Based on the league data below,
 provide specific actionable recommendations. Name actual players and be direct.
-
+{context_section}
 === MY ROSTER ===
 {roster}
 
@@ -557,7 +606,7 @@ How to optimize the lineup. Flag injured or underperforming players."""
 def render_dashboard():
     prof = st.session_state.active_profile
 
-    # ── Sidebar: nav controls ──
+    # ── Sidebar ──
     with st.sidebar:
         st.markdown(f"### 👤 {st.session_state.username}")
         st.markdown(f"**{prof['name']}**")
@@ -568,13 +617,45 @@ def render_dashboard():
         )
         st.markdown("---")
         if st.button("⬅ Switch Profile", use_container_width=True):
-            st.session_state.active_profile = None
+            st.session_state.active_profile   = None
+            st.session_state.chat_messages    = []
             go_to("profiles")
-        if st.button("✏️ Edit This Profile", use_container_width=True):
+        if st.button("✏️ Edit Settings", use_container_width=True):
             st.session_state.editing_profile = True
             st.rerun()
         if st.button("🚪 Log Out", use_container_width=True):
             logout()
+
+        # ── League Notes (inline, always visible) ──
+        st.markdown("---")
+        st.markdown(
+            "<div style='font-size:0.75rem;text-transform:uppercase;"
+            "letter-spacing:1.5px;color:#4a7fa5;margin-bottom:0.4rem'>"
+            "📝 League Notes</div>",
+            unsafe_allow_html=True,
+        )
+        st.caption("Keepers, trade rules, strategy — the AI reads this every time.")
+        new_ctx = st.text_area(
+            "league_notes_area",
+            value=prof.get("league_context", ""),
+            height=220,
+            label_visibility="collapsed",
+            placeholder=(
+                "Examples:\n"
+                "• 3 keepers allowed, cost = last round drafted − 1\n"
+                "• I'm keeping Acuña (rd 1), Betts (rd 2), Witt (rd 3)\n"
+                "• We're in win-now mode — don't suggest selling stars\n"
+                "• Avoid trading with Team X, they lowball\n"
+                "• Our league uses 6x6 with OPS instead of AVG"
+            ),
+        )
+        if st.button("💾 Save Notes", use_container_width=True, key="save_notes"):
+            auth.save_league_context(
+                prof["id"], st.session_state.user_id, new_ctx
+            )
+            st.session_state.active_profile["league_context"] = new_ctx
+            prof = st.session_state.active_profile
+            st.success("Saved!")
 
     # ── Profile editor (full-page overlay) ──
     if st.session_state.get("editing_profile"):
@@ -628,79 +709,143 @@ def render_dashboard():
         <div class="stat-value" style="font-size:1.1rem;margin-top:4px">
         {opp_str}</div></div>""", unsafe_allow_html=True)
 
-    # ── Two-column layout ──
-    left, right = st.columns([3, 2])
+    # ── Tabs ──
+    tab_overview, tab_chat = st.tabs(["📊 Overview", "🤖 AI Chat"])
 
-    with left:
-        st.markdown('<div class="section-header">📋 Current Roster</div>',
-                    unsafe_allow_html=True)
-        roster_data = get_roster_data(my_team)
-        rows_html = ""
-        for p in roster_data:
-            inj = (f'<span class="injury-tag">{p["injury"]}</span>'
-                   if p["injury"] else "")
-            rows_html += f"""<tr>
-                <td>{p['name']} {inj}</td>
-                <td>{p['pos']}</td>
-                <td>{p['proj']}</td>
-            </tr>"""
-        st.markdown(f"""
-        <table class="roster-table">
-            <thead><tr><th>Player</th><th>Position</th><th>Proj Pts</th></tr></thead>
-            <tbody>{rows_html}</tbody>
-        </table>""", unsafe_allow_html=True)
+    # ════════════════
+    #  OVERVIEW TAB
+    # ════════════════
+    with tab_overview:
+        left, right = st.columns([3, 2])
 
-    with right:
-        st.markdown('<div class="section-header">🏆 Standings</div>',
-                    unsafe_allow_html=True)
-        for i, team in enumerate(
-            sorted(league.teams, key=lambda t: t.wins, reverse=True), 1
-        ):
-            hl = ("border-left:3px solid #3b82f6;padding-left:0.5rem;"
-                  if team == my_team else "")
+        with left:
+            st.markdown('<div class="section-header">📋 Current Roster</div>',
+                        unsafe_allow_html=True)
+            roster_data = get_roster_data(my_team)
+            rows_html = ""
+            for p in roster_data:
+                inj = (f'<span class="injury-tag">{p["injury"]}</span>'
+                       if p["injury"] else "")
+                rows_html += f"""<tr>
+                    <td>{p['name']} {inj}</td>
+                    <td>{p['pos']}</td>
+                    <td>{p['proj']}</td>
+                </tr>"""
             st.markdown(f"""
-            <div class="standing-row" style="{hl}">
-                <span class="standing-rank">{i}</span>
-                <span class="standing-name">{team.team_name}</span>
-                <span class="standing-record">{team.wins}–{team.losses}</span>
-            </div>""", unsafe_allow_html=True)
+            <table class="roster-table">
+                <thead><tr><th>Player</th><th>Position</th><th>Proj Pts</th></tr></thead>
+                <tbody>{rows_html}</tbody>
+            </table>""", unsafe_allow_html=True)
 
-        st.markdown('<div class="section-header">🔄 Top Free Agents</div>',
-                    unsafe_allow_html=True)
-        for fa in get_free_agents(league):
-            st.markdown(f"""
-            <div class="fa-card">
-                <span class="fa-name">{fa['name']}</span>
-                <span class="fa-pos">{fa['pos']}</span>
-                <span class="fa-proj">{fa['proj']} pts</span>
-            </div>""", unsafe_allow_html=True)
+        with right:
+            st.markdown('<div class="section-header">🏆 Standings</div>',
+                        unsafe_allow_html=True)
+            for i, team in enumerate(
+                sorted(league.teams, key=lambda t: t.wins, reverse=True), 1
+            ):
+                hl = ("border-left:3px solid #3b82f6;padding-left:0.5rem;"
+                      if team == my_team else "")
+                st.markdown(f"""
+                <div class="standing-row" style="{hl}">
+                    <span class="standing-rank">{i}</span>
+                    <span class="standing-name">{team.team_name}</span>
+                    <span class="standing-record">{team.wins}–{team.losses}</span>
+                </div>""", unsafe_allow_html=True)
 
-    # ── AI Recommendations ──
-    st.markdown("---")
-    if not prof["api_key"]:
-        st.warning("Add an Anthropic API key to this profile to get AI recommendations.")
-    else:
-        if st.button("⚾  GET AI RECOMMENDATIONS"):
-            roster_ctx, standings_ctx, fa_ctx, matchup_ctx = build_context(
-                league, my_team
-            )
-            advice = get_ai_advice(
-                roster_ctx, standings_ctx, fa_ctx, matchup_ctx, prof["api_key"]
-            )
-            for section in advice.split("##"):
-                section = section.strip()
-                if not section:
-                    continue
-                lines   = section.split("\n", 1)
-                title   = lines[0].strip()
-                content = lines[1].strip() if len(lines) > 1 else ""
-                st.markdown(f"### {title}")
-                st.markdown(f'<div class="rec-card">{content}</div>',
-                            unsafe_allow_html=True)
+            st.markdown('<div class="section-header">🔄 Top Free Agents</div>',
+                        unsafe_allow_html=True)
+            for fa in get_free_agents(league):
+                st.markdown(f"""
+                <div class="fa-card">
+                    <span class="fa-name">{fa['name']}</span>
+                    <span class="fa-pos">{fa['pos']}</span>
+                    <span class="fa-proj">{fa['proj']} pts</span>
+                </div>""", unsafe_allow_html=True)
+
+        # ── AI Recommendations ──
+        st.markdown("---")
+        if not prof["api_key"]:
+            st.warning("Add an Anthropic API key to this profile to get AI recommendations.")
+        else:
+            if st.button("⚾  GET AI RECOMMENDATIONS"):
+                roster_ctx, standings_ctx, fa_ctx, matchup_ctx = build_context(
+                    league, my_team
+                )
+                advice = get_ai_advice(
+                    roster_ctx, standings_ctx, fa_ctx, matchup_ctx,
+                    prof["api_key"], prof.get("league_context", ""),
+                )
+                for section in advice.split("##"):
+                    section = section.strip()
+                    if not section:
+                        continue
+                    lines   = section.split("\n", 1)
+                    title   = lines[0].strip()
+                    content = lines[1].strip() if len(lines) > 1 else ""
+                    st.markdown(f"### {title}")
+                    st.markdown(f'<div class="rec-card">{content}</div>',
+                                unsafe_allow_html=True)
+
+    # ════════════════
+    #  AI CHAT TAB
+    # ════════════════
+    with tab_chat:
+        if not prof["api_key"]:
+            st.warning("Add an Anthropic API key to this profile to use AI Chat.")
+        else:
+            _render_ai_chat(prof, league, my_team)
+
+
+def _render_ai_chat(prof: dict, league, my_team):
+    """Conversational AI chat grounded in live league data + league notes."""
+    system_prompt = build_system_prompt(prof, league, my_team)
+    client        = anthropic.Anthropic(api_key=prof["api_key"])
+    messages      = st.session_state.chat_messages
+
+    # Welcome message on first load
+    if not messages:
+        st.markdown(
+            "<div style='color:#4a7fa5;font-size:0.88rem;margin-bottom:1rem'>"
+            "Ask me anything about your roster, matchup, free agents, or trade strategy. "
+            "I have your live league data and notes loaded.</div>",
+            unsafe_allow_html=True,
+        )
+
+    # Render history
+    for msg in messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    # Clear chat button
+    if messages:
+        if st.button("🗑️ Clear chat", key="clear_chat"):
+            st.session_state.chat_messages = []
+            st.rerun()
+
+    # Input
+    user_input = st.chat_input("Ask about your team, trades, lineup, keepers…")
+    if user_input:
+        messages.append({"role": "user", "content": user_input})
+        with st.chat_message("user"):
+            st.markdown(user_input)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking…"):
+                response = client.messages.create(
+                    model="claude-sonnet-4-20250514",
+                    max_tokens=1500,
+                    system=system_prompt,
+                    messages=messages,
+                )
+            reply = response.content[0].text
+            st.markdown(reply)
+
+        messages.append({"role": "assistant", "content": reply})
+        st.session_state.chat_messages = messages
 
 
 def _render_profile_editor(prof: dict):
-    st.markdown("### ✏️ Edit Profile")
+    st.markdown("### ✏️ Edit Profile Settings")
     with st.form("edit_profile_form"):
         e_name   = st.text_input("Profile name", value=prof["name"])
         c1, c2   = st.columns(2)
@@ -727,6 +872,7 @@ def _render_profile_editor(prof: dict):
             prof["id"], st.session_state.user_id,
             e_name.strip(), e_lid.strip(), int(e_year),
             e_s2, e_swid, e_apikey, e_team,
+            prof.get("league_context", ""),
         )
         updated_row = database.get_profile(prof["id"], st.session_state.user_id)
         if updated_row:

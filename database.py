@@ -42,6 +42,11 @@ def init_db() -> None:
                 updated_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # Add league_context column if upgrading from older schema
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(profiles)")}
+        if "league_context" not in cols:
+            conn.execute("ALTER TABLE profiles ADD COLUMN league_context TEXT DEFAULT ''")
+
         # Migrate old league_settings table if it exists
         tables = {r[0] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
@@ -127,6 +132,7 @@ def create_profile(
     swid_enc: str,
     api_key_enc: str,
     team_name_filter: str,
+    league_context: str = "",
 ) -> int:
     """Insert a new profile and return its id."""
     conn = get_connection()
@@ -136,11 +142,11 @@ def create_profile(
                 """
                 INSERT INTO profiles
                     (user_id, name, league_id, season_year, espn_s2, swid,
-                     anthropic_api_key, team_name_filter)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     anthropic_api_key, team_name_filter, league_context)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (user_id, name, league_id, season_year,
-                 espn_s2_enc, swid_enc, api_key_enc, team_name_filter),
+                 espn_s2_enc, swid_enc, api_key_enc, team_name_filter, league_context),
             )
         return cur.lastrowid
     finally:
@@ -157,6 +163,7 @@ def update_profile(
     swid_enc: str,
     api_key_enc: str,
     team_name_filter: str,
+    league_context: str = "",
 ) -> None:
     """Update an existing profile (must belong to user_id)."""
     conn = get_connection()
@@ -167,11 +174,29 @@ def update_profile(
                 UPDATE profiles
                 SET name = ?, league_id = ?, season_year = ?,
                     espn_s2 = ?, swid = ?, anthropic_api_key = ?,
-                    team_name_filter = ?, updated_at = CURRENT_TIMESTAMP
+                    team_name_filter = ?, league_context = ?,
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE id = ? AND user_id = ?
                 """,
                 (name, league_id, season_year, espn_s2_enc, swid_enc,
-                 api_key_enc, team_name_filter, profile_id, user_id),
+                 api_key_enc, team_name_filter, league_context, profile_id, user_id),
+            )
+    finally:
+        conn.close()
+
+
+def save_league_context(profile_id: int, user_id: int, league_context: str) -> None:
+    """Quick-save just the league_context field."""
+    conn = get_connection()
+    try:
+        with conn:
+            conn.execute(
+                """
+                UPDATE profiles
+                SET league_context = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND user_id = ?
+                """,
+                (league_context, profile_id, user_id),
             )
     finally:
         conn.close()
