@@ -289,12 +289,13 @@ section[data-testid="stSidebar"] {
 #  SESSION STATE DEFAULTS
 # ─────────────────────────────────────────────
 _SS_DEFAULTS = {
-    "page":             "login",   # login | profiles | dashboard
-    "user_id":          None,
-    "username":         None,
-    "active_profile":   None,      # decrypted profile dict
-    "editing_profile":  False,
-    "chat_messages":    [],        # AI chat history for active session
+    "page":               "login",   # login | profiles | dashboard
+    "user_id":            None,
+    "username":           None,
+    "active_profile":     None,      # decrypted profile dict
+    "editing_profile":    False,
+    "chat_messages":      [],        # AI chat history for active session
+    "league_refresh_key": 0,         # increment to bust load_league cache
 }
 for _k, _v in _SS_DEFAULTS.items():
     if _k not in st.session_state:
@@ -476,7 +477,7 @@ def render_profiles():
 #  LEAGUE HELPERS
 # ═════════════════════════════════════════════
 @st.cache_resource(show_spinner=False)
-def load_league(league_id, year, espn_s2, swid):
+def load_league(league_id, year, espn_s2, swid, refresh_key=0):
     kwargs = {"league_id": int(league_id), "year": int(year)}
     if espn_s2 and swid:
         kwargs["espn_s2"] = espn_s2
@@ -704,13 +705,22 @@ def render_dashboard():
         _render_profile_editor(prof)
         return
 
-    # ── Hero ──
-    st.markdown(f"""
-    <div class="hero">
-        <h1>Fantasy Baseball Advisor</h1>
-        <p>{prof['name']} · League {prof['league_id']} · {prof['season_year']}</p>
-    </div>
-    """, unsafe_allow_html=True)
+    # ── Hero + refresh button ──
+    hero_col, refresh_col = st.columns([5, 1])
+    with hero_col:
+        st.markdown(f"""
+        <div class="hero">
+            <h1>Fantasy Baseball Advisor</h1>
+            <p>{prof['name']} · League {prof['league_id']} · {prof['season_year']}</p>
+        </div>
+        """, unsafe_allow_html=True)
+    with refresh_col:
+        st.markdown("<div style='padding-top:1.6rem'>", unsafe_allow_html=True)
+        if st.button("🔄 Refresh", use_container_width=True, key="refresh_league",
+                     help="Fetch latest roster/standings from ESPN"):
+            st.session_state.league_refresh_key += 1
+            st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
 
     # ── Connect to ESPN ──
     try:
@@ -718,6 +728,7 @@ def render_dashboard():
             league = load_league(
                 prof["league_id"], prof["season_year"],
                 prof["espn_s2"], prof["swid"],
+                st.session_state.league_refresh_key,
             )
     except Exception as e:
         st.error(f"❌ Could not connect to ESPN: {e}")
@@ -727,8 +738,24 @@ def render_dashboard():
     my_team = find_team(league, prof["team_name_filter"])
     if not my_team:
         team_options = {t.team_name: t for t in league.teams}
-        selected = st.selectbox("Select your team", list(team_options.keys()))
-        my_team  = team_options[selected]
+        sel_col, save_col = st.columns([4, 1])
+        with sel_col:
+            selected = st.selectbox("Select your team", list(team_options.keys()))
+        with save_col:
+            st.markdown("<div style='padding-top:1.75rem'>", unsafe_allow_html=True)
+            if st.button("💾 Save", use_container_width=True, key="save_team",
+                         help="Save this as your default team for this profile"):
+                auth.update_profile(
+                    prof["id"], st.session_state.user_id,
+                    prof["name"], prof["league_id"], int(prof["season_year"]),
+                    prof["espn_s2"], prof["swid"], prof["api_key"],
+                    selected, prof.get("league_context", ""),
+                )
+                st.session_state.active_profile["team_name_filter"] = selected
+                st.success(f'"{selected}" saved as your team.')
+                st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
+        my_team = team_options[selected]
 
     # ── Stats bar ──
     matchup = get_matchup(league, my_team)
